@@ -1,0 +1,89 @@
+public async Task RunBackupAsync(string sourceDir, string destDir, CancellationToken ct = default)
+{
+    var files = Directory.GetFiles(sourceDir, "*", SearchOption.AllDirectories)
+                         .OrderBy(f => f)
+                         .ToList();
+
+    var pending = new[] { files.Count };
+
+    await using var session = await _display
+        .Create()
+        .WithTitle("[steelblue1]MyApp[/] — Backup")
+        .WithTasks(maxConcurrent: 3)
+        .WithSummary(completed: "Backed up", active: "Copying", queued: "Pending")
+        .WithQueuedCounter(() => Volatile.Read(ref pending[0]))
+        .StartAsync();
+
+    session.AddLog($"[grey]{Now()}[/]  Source: [white]{sourceDir}[/]");
+    session.AddLog($"[grey]{Now()}[/]  Found [white]{files.Count}[/] file(s)");
+
+    // Determinate — we know the total byte count up front
+    var totalBytes = files.Sum(f => new FileInfo(f).Length);
+    var copyTask   = session.AddTask("Copying files", maxValue: totalBytes);
+    var progress   = copyTask.AsProgress();
+    long copiedBytes = 0;
+
+    var semaphore = new SemaphoreSlim(3);
+
+    var workers = files.Select(async file =>
+    {
+        await semaphore.WaitAsync(ct);
+        Interlocked.Decrement(ref pending[0]);
+        try
+        {
+            var fileSize = new FileInfo(file).Length;
+            var relative = Path.GetRelativePath(sourceDir, file);
+            var dest     = Path.Combine(destDir, relative);
+
+            Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+
+            NativeFileCopy.Copy(file, dest, pct =>
+            {
+                var fileBytesTransferred = (long)(pct / 100.0 * fileSize);
+                progress.Report(new ProgressUpdate(
+                    Current:         copiedBytes + fileBytesTransferred,
+                    Total:           totalBytes,
+                    CurrentItemName: relative));
+            });
+
+            Interlocked.Add(ref copiedBytes, fileSize);
+            session.AddLog($"[grey]{Now()}[/]  [green]✓[/] {relative}");
+        }
+        catch (Exception ex)
+        {
+            progress.Report(new ProgressUpdate(
+                Current:         copiedBytes,
+                Total:           totalBytes,
+                CurrentItemName: Path.GetFileName(file),
+                Status:          UpdateStatus.Warning));
+
+            session.AddLog($"[yellow]{Now()}[/]  [yellow]⚠[/] Skipped {Path.GetFileName(file)}: {ex.Message}");
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+    });
+
+    await Task.WhenAll(workers);
+    copyTask.Complete();
+
+    // Indeterminate — verifying checksums, duration unknown
+    var verifyTask = session.AddTask("Verifying checksums");
+    await VerifyChecksumsAsync(sourceDir, destDir, ct);
+    verifyTask.Complete();
+
+    session.AddLog($"[grey]{Now()}[/]  [green]Backup complete —[/] [white]{FormatBytes(totalBytes)}[/] copied");
+
+    await session.CompleteAsync();
+}
+
+private static string Now()         => DateTime.Now.ToString("HH:mm:ss");
+private static string FormatBytes(long b) =>
+    b switch
+    {
+        >= 1_073_741_824 => $"{b / 1_073_741_824.0:F1} GB",
+        >= 1_048_576     => $"{b / 1_048_576.0:F1} MB",
+        >= 1_024         => $"{b / 1_024.0:F1} KB",
+        _                => $"{b} B"
+    };
